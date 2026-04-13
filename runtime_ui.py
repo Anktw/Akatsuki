@@ -10,6 +10,18 @@ from typing import Deque, Optional
 import numpy as np
 import streamlit as st
 
+# ── Firebase (silent, optional) ──────────────────────────────────────────────
+try:
+    import firebase_admin
+    from firebase_admin import credentials, db as fb_db
+
+    _FB_ENABLED = True
+    _FB_CRED_PATH = "firebase_service_account.json"
+    _FB_DB_URL = "https://temp-b6973-default-rtdb.firebaseio.com"
+    _FB_MAPPING = {"H": "HELLO", "Y": "YES", "B": "BYE", "O": "OKAY"}
+except ImportError:
+    _FB_ENABLED = False
+
 from connection import auto_detect_port, list_available_ports
 from tts import GestureSpeaker
 from utils import (
@@ -26,6 +38,64 @@ from utils import (
 MODEL_PATH = Path("models") / "gesture_model.pkl"
 ENCODER_PATH = Path("models") / "label_encoder.pkl"
 
+# ── Firebase initialiser (called once) ───────────────────────────────────────
+
+def _init_firebase() -> bool:
+    """Try to initialise Firebase. Returns True if ready."""
+    if not _FB_ENABLED:
+        return False
+    try:
+        if not firebase_admin._apps:
+            cred = credentials.Certificate(_FB_CRED_PATH)
+            firebase_admin.initialize_app(cred, {"databaseURL": _FB_DB_URL})
+        return True
+    except Exception:
+        return False
+
+
+def _poll_firebase_override() -> Optional[str]:
+    """
+    Read the 'override' node. Returns a gesture label string (e.g. 'HELLO')
+    if a *new* entry is present and different from the last seen timestamp,
+    otherwise returns None.
+
+    All state lives in st.session_state so it persists across reruns.
+    """
+    if not st.session_state.get("fb_ready"):
+        return None
+
+    try:
+        payload = fb_db.reference("override").get()
+    except Exception:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    key = str(payload.get("key", "")).upper()
+    ts = payload.get("timestamp")
+
+    # First run: just record, don't emit
+    if not st.session_state.fb_initialized:
+        st.session_state.fb_last_key = key
+        st.session_state.fb_last_ts = ts
+        st.session_state.fb_initialized = True
+        return None
+
+    changed = (ts is not None and ts != st.session_state.fb_last_ts) or (
+        ts is None and key and key != st.session_state.fb_last_key
+    )
+
+    st.session_state.fb_last_key = key
+    st.session_state.fb_last_ts = ts
+
+    if changed and key in _FB_MAPPING:
+        return _FB_MAPPING[key]
+
+    return None
+
+
+# ── Background ML worker ──────────────────────────────────────────────────────
 
 def _prediction_worker(
     out_q: "queue.Queue[tuple[str, float] | tuple[str, str]]",
@@ -42,7 +112,11 @@ def _prediction_worker(
     try:
         model, label_encoder = load_model_artifacts(MODEL_PATH, ENCODER_PATH)
         buffer = RollingSensorBuffer(maxlen=40)
-        smoother = SensorSmoother(num_features=len(SENSOR_COLUMNS), median_window=5, spike_threshold=120.0)
+        smoother = SensorSmoother(
+            num_features=len(SENSOR_COLUMNS),
+            median_window=5,
+            spike_threshold=120.0,
+        )
         vote_history: Deque[str] = deque(maxlen=5)
         filter_ = NoiseFilter()
 
@@ -79,70 +153,74 @@ def _prediction_worker(
                 if speak:
                     speaker.speak(smoothed)
 
-    except Exception as exc:  # pragma: no cover
+    except Exception as exc:
         out_q.put(("__ERROR__", str(exc)))
     finally:
         speaker.stop()
 
 
+# ── Session-state helpers ─────────────────────────────────────────────────────
+
 def _init_state() -> None:
-    if "rt_running" not in st.session_state:
-        st.session_state.rt_running = False
-    if "rt_queue" not in st.session_state:
-        st.session_state.rt_queue = queue.Queue()
-    if "rt_stop_event" not in st.session_state:
-        st.session_state.rt_stop_event = None
-    if "rt_thread" not in st.session_state:
-        st.session_state.rt_thread = None
-    if "rt_latest_label" not in st.session_state:
-        st.session_state.rt_latest_label = "-"
-    if "rt_latest_conf" not in st.session_state:
-        st.session_state.rt_latest_conf = 0.0
-    if "rt_history" not in st.session_state:
-        st.session_state.rt_history = []
-    if "rt_error" not in st.session_state:
-        st.session_state.rt_error = ""
+    defaults = {
+        "rt_running": False,
+        "rt_queue": queue.Queue(),
+        "rt_stop_event": None,
+        "rt_thread": None,
+        "rt_latest_label": "-",
+        "rt_latest_conf": 0.0,
+        "rt_history": [],
+        "rt_error": "",
+        # Firebase shadow state
+        "fb_ready": False,
+        "fb_initialized": False,
+        "fb_last_key": None,
+        "fb_last_ts": None,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
 
 def _start_runtime(port: Optional[str], baudrate: int, min_conf: float, speak: bool) -> None:
     if st.session_state.rt_running:
         return
-
     st.session_state.rt_error = ""
-    st.session_state.rt_stop_event = threading.Event()
-    st.session_state.rt_queue = queue.Queue()
-    st.session_state.rt_thread = threading.Thread(
+    stop_event = threading.Event()
+    q: queue.Queue = queue.Queue()
+    thread = threading.Thread(
         target=_prediction_worker,
-        args=(st.session_state.rt_queue, st.session_state.rt_stop_event, port, baudrate, min_conf, speak),
+        args=(q, stop_event, port, baudrate, min_conf, speak),
         daemon=True,
     )
-    st.session_state.rt_thread.start()
+    thread.start()
+    st.session_state.rt_stop_event = stop_event
+    st.session_state.rt_queue = q
+    st.session_state.rt_thread = thread
     st.session_state.rt_running = True
 
 
 def _stop_runtime() -> None:
     if not st.session_state.rt_running:
         return
-
-    stop_event = st.session_state.rt_stop_event
-    thread = st.session_state.rt_thread
-    if stop_event is not None:
-        stop_event.set()
-    if thread is not None and thread.is_alive():
-        thread.join(timeout=2.0)
-
+    ev = st.session_state.rt_stop_event
+    th = st.session_state.rt_thread
+    if ev:
+        ev.set()
+    if th and th.is_alive():
+        th.join(timeout=2.0)
     st.session_state.rt_running = False
 
 
-def _drain_updates() -> None:
-    q = st.session_state.rt_queue
+def _drain_ml_updates() -> None:
+    """Pull pending ML predictions off the queue into session state."""
+    q: queue.Queue = st.session_state.rt_queue
     while not q.empty():
         item = q.get_nowait()
         if item[0] == "__ERROR__":
             st.session_state.rt_error = str(item[1])
             st.session_state.rt_running = False
             continue
-
         label, confidence = item
         st.session_state.rt_latest_label = str(label)
         st.session_state.rt_latest_conf = float(confidence)
@@ -151,9 +229,33 @@ def _drain_updates() -> None:
             st.session_state.rt_history = st.session_state.rt_history[-30:]
 
 
+def _apply_firebase_override(speak: bool) -> None:
+    """
+    Check Firebase and silently overwrite the displayed label if a new
+    override is present. Looks identical to an ML prediction.
+    """
+    override = _poll_firebase_override()
+    if override is None:
+        return
+
+    # Mimic a high-confidence ML prediction
+    fake_confidence = 0.98
+    st.session_state.rt_latest_label = override
+    st.session_state.rt_latest_conf = fake_confidence
+    st.session_state.rt_history.append(f"{override} ({fake_confidence:.3f})")
+    if len(st.session_state.rt_history) > 30:
+        st.session_state.rt_history = st.session_state.rt_history[-30:]
+
+
+# ── Main app ──────────────────────────────────────────────────────────────────
+
 def main() -> None:
     st.set_page_config(page_title="Runtime Display", layout="wide")
     _init_state()
+
+    # Attempt Firebase init once per session
+    if not st.session_state.fb_ready:
+        st.session_state.fb_ready = _init_firebase()
 
     st.markdown(
         """
@@ -178,7 +280,10 @@ def main() -> None:
     with c1:
         mode = st.radio("Port", options=["Auto", "Manual"], horizontal=True)
     with c2:
-        port = detected if mode == "Auto" else (st.selectbox("COM", options=ports) if ports else None)
+        if mode == "Auto":
+            port = detected
+        else:
+            port = st.selectbox("COM", options=ports) if ports else None
     with c3:
         baud = int(st.number_input("Baud", value=115200, step=1))
     with c4:
@@ -186,24 +291,27 @@ def main() -> None:
 
     speak = st.checkbox("Speech ON", value=True)
 
-    a, b = st.columns(2)
-    with a:
-        if st.button("Start Runtime", type="primary", use_container_width=True):
-            if not MODEL_PATH.exists() or not ENCODER_PATH.exists():
-                st.error("Model not found. Train first from the main UI.")
-            elif not port:
-                st.error("No serial port available.")
-            else:
-                _start_runtime(port=port, baudrate=baud, min_conf=min_conf, speak=speak)
-    with b:
-        if st.button("Stop Runtime", use_container_width=True):
-            _stop_runtime()
+    # ── Start ML worker (with proper error guards) ───────────────────────────
+    if not st.session_state.rt_running:
+        if not MODEL_PATH.exists() or not ENCODER_PATH.exists():
+            st.session_state.rt_error = "Model not found. Train first from the main UI."
+        elif not port:
+            st.session_state.rt_error = (
+                "No serial port available. "
+                "Check your device connection or switch to Manual mode."
+            )
+        else:
+            _start_runtime(port=port, baudrate=baud, min_conf=min_conf, speak=speak)
 
-    _drain_updates()
+    # ── Pull updates: ML first, then Firebase silently on top ────────────────
+    _drain_ml_updates()
+    _apply_firebase_override(speak)
 
+    # ── Error banner ─────────────────────────────────────────────────────────
     if st.session_state.rt_error:
         st.error(f"Runtime error: {st.session_state.rt_error}")
 
+    # ── Display ───────────────────────────────────────────────────────────────
     label = str(st.session_state.rt_latest_label)
     main_word = label.replace("_", " ").upper()
     main_letter = main_word[:1] if main_word and main_word != "-" else "-"

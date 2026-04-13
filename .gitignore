@@ -6,6 +6,9 @@ __pycache__/
 # C extensions
 *.so
 
+firebase_service_account.json
+runtime_user_interface.py
+
 # Distribution / packaging
 .Python
 build/
@@ -25,6 +28,9 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+/data
+/models
+
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
