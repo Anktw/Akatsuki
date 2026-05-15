@@ -1,6 +1,9 @@
 # Akatsuki(Team name)
 # SignSense(Project name)
-Vihan 9.0 Project
+
+**Vihan 9.0 Project**
+
+This project explores a different approach: flex sensors on a glove, capturing finger bend angles directly, combined with an on-device LSTM model and a streaming inference pipeline that translates gestures into speech in real time.
 
 ## Real-Time Sign Language to Speech (Arduino + Python)
 
